@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    container_name: expensebot_db
+    environment:
+      POSTGRES_USER: expense_user
+      POSTGRES_PASSWORD: expense_password
+      POSTGRES_DB: expense_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data: 
