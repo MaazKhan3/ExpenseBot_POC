@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Intelligent ExpenseBot Chat</title>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    body { background: #ece5dd; font-family: 'Roboto', sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; }
+    .chat-container { max-width: 420px; margin: 40px auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); display: flex; flex-direction: column; height: 80vh; overflow: hidden; }
+    .chat-header { background: #0b5ed7; color: #fff; padding: 18px; font-size: 1.2rem; font-weight: 700; text-align: center; letter-spacing: 1px; }
+    .chat-messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; background: #ece5dd; }
+    .msg { max-width: 75%; padding: 12px 16px; border-radius: 18px; font-size: 1rem; line-height: 1.5; word-break: break-word; box-shadow: 0 2px 8px rgba(0,0,0,0.04); position: relative; opacity: 0; animation: fadeIn 0.3s forwards; }
+    .msg.user { align-self: flex-end; background: #dcf8c6; color: #222; border-bottom-right-radius: 4px; }
+    .msg.bot { align-self: flex-start; background: #fff; color: #222; border-bottom-left-radius: 4px; border: 1px solid #e0e0e0; }
+    @keyframes fadeIn { to { opacity: 1; } }
+    .chat-input { display: flex; padding: 16px; background: #f7f7f7; border-top: 1px solid #e0e0e0; }
+    .chat-input input { flex: 1; padding: 12px 16px; border: none; border-radius: 24px; font-size: 1rem; outline: none; background: #ece5dd; margin-right: 10px; transition: box-shadow 0.2s; }
+    .chat-input input:focus { box-shadow: 0 0 0 2px #0b5ed7; }
+    .chat-input button { background: #25d366; color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; font-size: 1.3rem; cursor: pointer; transition: background 0.2s; display: flex; align-items: center; justify-content: center; }
+    .chat-input button:hover { background: #128c7e; }
+  </style>
+</head>
+<body>
+  <div class="chat-container">
+    <div class="chat-header">Intelligent ExpenseBot 💡</div>
+    <div class="chat-messages" id="chat-messages"></div>
+    <form class="chat-input" id="chat-form">
+      <input type="text" id="user-input" placeholder="Type a message..." autocomplete="off" required />
+      <button type="submit">➤</button>
+    </form>
+  </div>
+  <script>
+    const chatMessages = document.getElementById('chat-messages');
+    const chatForm = document.getElementById('chat-form');
+    const userInput = document.getElementById('user-input');
+    const phoneNumber = '923001234567'; // For demo/testing
+
+    function appendMessage(text, sender) {
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'msg ' + sender;
+      msgDiv.innerText = text;
+      chatMessages.appendChild(msgDiv);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    async function sendMessage(message) {
+      appendMessage(message, 'user');
+      userInput.value = '';
+      try {
+        const res = await fetch('/intelligent_webhook', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            phone_number: phoneNumber,
+            message_body: message,
+            timestamp: new Date().toISOString()
+          })
+        });
+        const data = await res.json();
+        let botMsg = '';
+        if (data.confirmation) botMsg = data.confirmation;
+        else if (data.clarification) botMsg = data.clarification;
+        else if (data.query_result) botMsg = data.query_result;
+        else if (data.summary) botMsg = data.summary;
+        else if (data.breakdown_result) botMsg = data.breakdown_result;
+        else if (data.message) botMsg = data.message;
+        else botMsg = '🤖 Sorry, I did not understand that.';
+        appendMessage(botMsg, 'bot');
+      } catch (err) {
+        appendMessage('Error contacting bot.', 'bot');
+      }
+    }
+
+    chatForm.addEventListener('submit', e => {
+      e.preventDefault();
+      const message = userInput.value.trim();
+      if (message) sendMessage(message);
+    });
+
+    // Greet the user
+    window.onload = () => {
+      appendMessage('Hi! I am the new Intelligent ExpenseBot. Ask me anything about your expenses, summaries, or even just say hi!', 'bot');
+    };
+  </script>
+</body>
+</html> 
