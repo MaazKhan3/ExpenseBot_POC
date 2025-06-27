@@ -13,6 +13,7 @@ from pydantic import SecretStr
 import os
 import json
 from app import crud
+import re
 
 logger = logging.getLogger("expensebot.intelligent_agent.graph")
 
@@ -84,7 +85,10 @@ RULES:
 - If user asks about total spending for time periods (today, week, month), use get_total_expenses_tool
 - If user greets, use greeting_tool
 - If user provides context for previous conversation (like "yeah i bought a car"), use query_expenses_tool to acknowledge
-- If unclear, use clarification_tool
+- **IMPORTANT: If user says "yes", "yes please", "sure", etc. and there's conversation context about a previous question, use query_expenses_tool to provide the requested details**
+- **IMPORTANT: Only use log_expense_tool for ambiguous inputs if there's pending expense context AND the user message could reasonably be a response to the pending question (like a number, "yes", "no", etc.)**
+- **For random ambiguous inputs like "b", "v", "m" without clear context, use clarification_tool**
+- If unclear and no pending context, use clarification_tool
 
 Output ONLY a JSON object with:
 - "reasoning": Your step-by-step reasoning
@@ -145,6 +149,60 @@ User: "hi"
   "extracted_data": {{}}
 }}
 
+User: "b" (with pending expense context)
+{{
+  "reasoning": "Ambiguous input - could be random typing, not clearly a response to pending question",
+  "tool_name": "clarification_tool",
+  "intent": "clarification",
+  "extracted_data": {{}}
+}}
+
+User: "900" (with pending expense context asking for amount)
+{{
+  "reasoning": "Clear number response to pending amount question",
+  "tool_name": "log_expense_tool",
+  "intent": "log_expense",
+  "extracted_data": {{
+    "amount": 900
+  }}
+}}
+
+User: "yes" (with pending expense context)
+{{
+  "reasoning": "Clear affirmative response to pending question",
+  "tool_name": "log_expense_tool",
+  "intent": "log_expense",
+  "extracted_data": {{}}
+}}
+
+User: "yes please" (after being asked to show rent details)
+{{
+  "reasoning": "Affirmative response to previous question about showing rent details",
+  "tool_name": "query_expenses_tool",
+  "intent": "show_details",
+  "extracted_data": {{
+    "query_type": "rent_details"
+  }}
+}}
+
+User: "14k" (with pending expense context asking for amount)
+{{
+  "reasoning": "Clear number response to pending amount question",
+  "tool_name": "log_expense_tool",
+  "intent": "log_expense",
+  "extracted_data": {{
+    "amount": 14000
+  }}
+}}
+
+User: "v" (no pending context)
+{{
+  "reasoning": "Random ambiguous input without context",
+  "tool_name": "clarification_tool",
+  "intent": "clarification",
+  "extracted_data": {{}}
+}}
+
 Output ONLY the JSON object.
 """
 
@@ -174,21 +232,130 @@ Output ONLY the JSON object.
             action_data = json.loads(json_str)
             logger.info(f"🤖 Router parsed data: {action_data}")
         else:
-            # Fallback
-            action_data = {
-                "reasoning": "Fallback analysis",
-                "tool_name": "clarification_tool",
-                "intent": "clarification",
-                "extracted_data": {}
-            }
+            # Try to extract amount using regex as fallback
+            amount_match = re.search(r'"amount":\s*(\d+k?)', llm_response, re.IGNORECASE)
+            if amount_match:
+                amount_str = amount_match.group(1)
+                amount = parse_amount(amount_str)
+                if amount and pending_expense:
+                    logger.info(f"🤖 Regex fallback extracted amount: {amount}")
+                    action_data = {
+                        "reasoning": "Regex fallback for amount extraction",
+                        "tool_name": "log_expense_tool",
+                        "intent": "log_expense",
+                        "extracted_data": {
+                            "amount": amount
+                        }
+                    }
+                else:
+                    # Fallback - check if we have pending expense context
+                    if pending_expense:
+                        # Only route to log_expense_tool if the message could be a reasonable response
+                        user_msg_lower = user_message.lower().strip()
+                        if (user_msg_lower.isdigit() or 
+                            user_msg_lower in ['yes', 'no', 'y', 'n'] or
+                            parse_amount(user_msg_lower) is not None):
+                            logger.info(f"🤖 Router fallback with pending expense and reasonable response: {pending_expense}")
+                            action_data = {
+                                "reasoning": "Fallback with pending expense context and reasonable response",
+                                "tool_name": "log_expense_tool",
+                                "intent": "log_expense",
+                                "extracted_data": {}
+                            }
+                        else:
+                            logger.info(f"🤖 Router fallback with pending expense but ambiguous response: {user_message}")
+                            action_data = {
+                                "reasoning": "Fallback with pending expense but ambiguous response",
+                                "tool_name": "clarification_tool",
+                                "intent": "clarification",
+                                "extracted_data": {}
+                            }
+                    else:
+                        action_data = {
+                            "reasoning": "Fallback analysis",
+                            "tool_name": "clarification_tool",
+                            "intent": "clarification",
+                            "extracted_data": {}
+                        }
     except Exception as e:
         logger.error(f"🤖 Router JSON parse error: {e}")
-        action_data = {
-            "reasoning": "JSON parse error fallback",
-            "tool_name": "clarification_tool",
-            "intent": "clarification",
-            "extracted_data": {}
-        }
+        logger.error(f"🤖 Raw LLM response: {llm_response}")
+        
+        # Try to extract amount using regex as fallback
+        amount_match = re.search(r'"amount":\s*(\d+k?)', llm_response, re.IGNORECASE)
+        if amount_match:
+            amount_str = amount_match.group(1)
+            amount = parse_amount(amount_str)
+            if amount and pending_expense:
+                logger.info(f"🤖 Regex fallback extracted amount: {amount}")
+                action_data = {
+                    "reasoning": "Regex fallback for amount extraction",
+                    "tool_name": "log_expense_tool",
+                    "intent": "log_expense",
+                    "extracted_data": {
+                        "amount": amount
+                    }
+                }
+            else:
+                # Fallback - check if we have pending expense context
+                if pending_expense:
+                    # Only route to log_expense_tool if the message could be a reasonable response
+                    user_msg_lower = user_message.lower().strip()
+                    if (user_msg_lower.isdigit() or 
+                        user_msg_lower in ['yes', 'no', 'y', 'n'] or
+                        parse_amount(user_msg_lower) is not None):
+                        logger.info(f"🤖 Router fallback with pending expense and reasonable response: {pending_expense}")
+                        action_data = {
+                            "reasoning": "Fallback with pending expense context and reasonable response",
+                            "tool_name": "log_expense_tool",
+                            "intent": "log_expense",
+                            "extracted_data": {}
+                        }
+                    else:
+                        logger.info(f"🤖 Router fallback with pending expense but ambiguous response: {user_message}")
+                        action_data = {
+                            "reasoning": "Fallback with pending expense but ambiguous response",
+                            "tool_name": "clarification_tool",
+                            "intent": "clarification",
+                            "extracted_data": {}
+                        }
+                else:
+                    action_data = {
+                        "reasoning": "Fallback analysis",
+                        "tool_name": "clarification_tool",
+                        "intent": "clarification",
+                        "extracted_data": {}
+                    }
+        else:
+            # Fallback - check if we have pending expense context
+            if pending_expense:
+                # Only route to log_expense_tool if the message could be a reasonable response
+                user_msg_lower = user_message.lower().strip()
+                if (user_msg_lower.isdigit() or 
+                    user_msg_lower in ['yes', 'no', 'y', 'n'] or
+                    parse_amount(user_msg_lower) is not None):
+                    logger.info(f"🤖 Router fallback with pending expense and reasonable response: {pending_expense}")
+                    action_data = {
+                        "reasoning": "Fallback with pending expense context and reasonable response",
+                        "tool_name": "log_expense_tool",
+                        "intent": "log_expense",
+                        "extracted_data": {}
+                    }
+                else:
+                    logger.info(f"🤖 Router fallback with pending expense but ambiguous response: {user_message}")
+                    action_data = {
+                        "reasoning": "Fallback with pending expense but ambiguous response",
+                        "tool_name": "clarification_tool",
+                        "intent": "clarification",
+                        "extracted_data": {}
+                    }
+            else:
+                action_data = {
+                    "reasoning": "Fallback analysis",
+                    "tool_name": "clarification_tool",
+                    "intent": "clarification",
+                    "extracted_data": {}
+                }
 
     # Update state with router decision
     state["tool_name"] = action_data.get("tool_name", "clarification_tool")
@@ -205,7 +372,7 @@ Output ONLY the JSON object.
 
 # --- Tool Nodes ---
 def log_expense_tool(state: AgentState) -> AgentState:
-    """Tool: Handle expense logging with proper context awareness"""
+    """Tool: Handle expense logging with robust slot-filling and context awareness"""
     db = state.get("db")
     user_id = state.get("user_id")
     amount = state.get("amount")
@@ -213,10 +380,11 @@ def log_expense_tool(state: AgentState) -> AgentState:
     category = state.get("category")
     phone_number = state.get("phone_number")
     pending_expense = state.get("pending_expense")
-    
+    user_message = state.get("user_message")
+
     logger.info(f"🔧 Log Expense Tool: amount={amount}, item={item}, category={category}")
     logger.info(f"🔧 Pending expense: {pending_expense}")
-    
+
     # Check if user_id is valid
     if user_id is None:
         state["tool_result"] = {
@@ -225,47 +393,81 @@ def log_expense_tool(state: AgentState) -> AgentState:
             "response": "User account not found. Please try again."
         }
         return state
-    
-    # Handle context from pending expense
-    if pending_expense and not amount:
-        amount = pending_expense.get("amount")
-        state["amount"] = amount
-        logger.info(f"🔧 Using pending amount: {amount}")
-    
-    if pending_expense and not item:
-        item = pending_expense.get("item")
-        state["item"] = item
-        logger.info(f"🔧 Using pending item: {item}")
-    
+
+    # Helper: Try to infer if the message is an amount or item
+    def infer_amount_or_item(msg):
+        try:
+            amt = parse_amount(msg)
+            if amt:
+                return amt, None
+        except Exception:
+            pass
+        # If not a number, treat as item
+        return None, msg.strip() if msg.strip() else None
+
+    # Merge with pending expense if exists
+    if pending_expense:
+        # If new info is missing, try to infer from user message
+        if not amount and not item:
+            amt, itm = infer_amount_or_item(user_message)
+            if amt:
+                amount = amt
+                state["amount"] = amt
+            if itm:
+                item = itm
+                state["item"] = itm
+        # Use pending if still missing
+        if not amount:
+            amount = pending_expense.get("amount")
+            state["amount"] = amount
+        if not item:
+            item = pending_expense.get("item")
+            state["item"] = item
+        if not category:
+            category = pending_expense.get("category")
+            state["category"] = category
+
     # Parse amount if string
     if amount and isinstance(amount, str):
         amount = parse_amount(amount)
         state["amount"] = amount
-    
+
     # Determine what's missing
     missing_info = []
     if not amount:
         missing_info.append("amount")
     if not item:
         missing_info.append("item")
-    
+
     if missing_info:
-        # Incomplete expense - ask for missing info
+        # Incomplete expense - ask for missing info, referencing both old and new
+        context_parts = []
+        if pending_expense:
+            if pending_expense.get("amount"):
+                context_parts.append(f"amount '{pending_expense.get('amount')}'")
+            if pending_expense.get("item"):
+                context_parts.append(f"item '{pending_expense.get('item')}'")
+        if amount:
+            context_parts.append(f"amount '{amount}'")
+        if item:
+            context_parts.append(f"item '{item}'")
+        context_str = ", ".join(context_parts)
+        if context_str:
+            context_str = f"I have {context_str}. "
+        # Custom clarification
         if "amount" in missing_info and "item" in missing_info:
-            response = "I need both the amount and what you bought. Could you please provide both?"
+            response = f"{context_str}Could you please provide both the amount and what you bought?"
         elif "amount" in missing_info:
-            response = f"What was the cost of {item}?"
+            response = f"{context_str}What was the cost of {item or '[item]'}?"
         else:  # missing item
-            response = f"What did you buy for {amount} PKR?"
-        
-        # Store pending expense context
+            response = f"{context_str}What did you buy for {amount if amount else '[amount]'} PKR?"
+        # Store merged pending expense
         pending_data = {
             "amount": amount,
             "item": item,
             "category": category
         }
         memory.set_pending_expense(phone_number, pending_data)
-        
         state["tool_result"] = {
             "status": "incomplete",
             "missing": missing_info,
@@ -279,11 +481,9 @@ def log_expense_tool(state: AgentState) -> AgentState:
             if not category and item:
                 category = map_category(item)
                 state["category"] = category
-            
             # Ensure amount is a valid number
             if amount is None:
                 raise ValueError("Amount is required")
-            
             # Create category and expense
             db_category = crud.get_or_create_category(db, user_id, category or "misc")
             db_expense = crud.create_expense(
@@ -293,10 +493,8 @@ def log_expense_tool(state: AgentState) -> AgentState:
                 amount=float(amount),
                 note=item or ""
             )
-            
-            # Clear pending expense
+            # Clear pending expense only after success
             memory.set_pending_expense(phone_number, None)
-            
             state["tool_result"] = {
                 "status": "success",
                 "expense_id": getattr(db_expense, "id"),
@@ -305,9 +503,7 @@ def log_expense_tool(state: AgentState) -> AgentState:
                 "item": item,
                 "response": f"Successfully logged {amount:,.0f} PKR for {category or item}."
             }
-            
             logger.info(f"✅ Logged expense: {amount} PKR for {category or item}")
-            
         except Exception as e:
             logger.error(f"❌ Expense logging error: {e}")
             state["tool_result"] = {
@@ -315,7 +511,6 @@ def log_expense_tool(state: AgentState) -> AgentState:
                 "error": str(e),
                 "response": "Failed to log expense. Please try again."
             }
-    
     return state
 
 def query_expenses_tool(state: AgentState) -> AgentState:
@@ -349,10 +544,77 @@ def query_expenses_tool(state: AgentState) -> AgentState:
             }
             return state
         
+        # Handle specific detail requests
+        if intent == "show_details":
+            # Handle rent details request
+            sql = f"""
+            SELECT 
+                e.amount,
+                e.timestamp,
+                e.note
+            FROM expenses e
+            JOIN categories c ON e.category_id = c.id
+            WHERE e.user_id = {user_id} AND c.name = 'rent'
+            ORDER BY e.timestamp DESC
+            """
+            results = tools.execute_sql_query(sql)
+            if results:
+                response = "Here are your rent payment details:\n\n"
+                for i, payment in enumerate(results, 1):
+                    date = payment['timestamp'].strftime('%B %d, %Y') if hasattr(payment['timestamp'], 'strftime') else str(payment['timestamp'])
+                    response += f"{i}. {payment['amount']:,.0f} PKR on {date}\n"
+            else:
+                response = "I couldn't find any rent payments in your records."
+            state["tool_result"] = {
+                "status": "success",
+                "response": response,
+                "query_type": "rent_details"
+            }
+            return state
+        
         # Determine query type from message
         message_lower = user_message.lower()
         
-        if "most expensive" in message_lower or "highest" in message_lower:
+        # Handle specific category queries
+        if "electronics" in message_lower or "electronic" in message_lower:
+            results = tools.get_category_breakdown(user_id, "all")
+            if results:
+                # Find electronics in the breakdown
+                electronics_data = None
+                for row in results:
+                    if row['category'].lower() == 'electronics':
+                        electronics_data = row
+                        break
+                
+                if electronics_data:
+                    response = f"You've spent a total of {electronics_data['total_amount']:,.0f} PKR on electronics across {electronics_data['transaction_count']} purchases."
+                else:
+                    response = "I couldn't find any electronics expenses in your records."
+            else:
+                response = "I couldn't find any electronics expenses in your records."
+        
+        elif "rent" in message_lower and ("when" in message_lower or "date" in message_lower or "time" in message_lower):
+            # Get specific rent payment details
+            sql = f"""
+            SELECT 
+                e.amount,
+                e.timestamp,
+                e.note
+            FROM expenses e
+            JOIN categories c ON e.category_id = c.id
+            WHERE e.user_id = {user_id} AND c.name = 'rent'
+            ORDER BY e.timestamp DESC
+            """
+            results = tools.execute_sql_query(sql)
+            if results:
+                response = "Here are your rent payment details:\n\n"
+                for i, payment in enumerate(results, 1):
+                    date = payment['timestamp'].strftime('%B %d, %Y') if hasattr(payment['timestamp'], 'strftime') else str(payment['timestamp'])
+                    response += f"{i}. {payment['amount']:,.0f} PKR on {date}\n"
+            else:
+                response = "I couldn't find any rent payments in your records."
+        
+        elif "most expensive" in message_lower or "highest" in message_lower:
             result = tools.get_max_expense(user_id, "all")
             if result:
                 response = f"Your most expensive purchase was {result['amount']:,.0f} PKR for {result['category']}."
@@ -597,6 +859,7 @@ def map_category(item):
         "shirt": "clothing", "pants": "clothing", "shoes": "clothing",
         "dress": "clothing", "jacket": "clothing", "leather jacket": "clothing",
         "coat": "clothing", "sweater": "clothing", "jeans": "clothing",
+        "t shirt": "clothing", "tshirt": "clothing", "joggers": "clothing",
         
         # Furniture/Home
         "chair": "furniture", "table": "furniture", "bed": "furniture",
@@ -608,7 +871,7 @@ def map_category(item):
         # Entertainment
         "movie": "entertainment", "cinema": "entertainment", "game": "entertainment",
         "concert": "entertainment", "ticket": "entertainment", "toy": "entertainment",
-        "toy car": "entertainment",
+        "toy car": "entertainment", "movie ticket": "entertainment",
         
         # Health
         "medicine": "health", "doctor": "health", "hospital": "health",
