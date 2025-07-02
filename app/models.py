@@ -1,3 +1,5 @@
+# models.py
+
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
