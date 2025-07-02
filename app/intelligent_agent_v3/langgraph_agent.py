@@ -11,6 +11,7 @@ from .tools import (
     FormatBreakdownTool,
     ChitchatTool,
     RespondTool,
+    FormatQueryResponseTool,
 )
 
 
@@ -57,6 +58,7 @@ builder.add_node("generate_breakdown", FormatBreakdownTool())
 builder.add_node("chitchat", ChitchatTool())
 builder.add_node("fallback", RespondTool())
 builder.add_node("respond", RespondTool())
+builder.add_node("format_query_response", FormatQueryResponseTool())
 
 # Set edges
 builder.set_entry_point("detect_intent")
@@ -64,10 +66,11 @@ builder.add_conditional_edges("detect_intent", router)
 builder.add_edge("extract_expense", "create_expense")
 builder.add_edge("create_expense", "respond")
 builder.add_edge("generate_sql", "execute_sql")
-builder.add_edge("execute_sql", "respond")
+builder.add_edge("execute_sql", "format_query_response")
 builder.add_edge("generate_breakdown", "respond")
 builder.add_edge("chitchat", "respond")
 builder.add_edge("fallback", "respond")
+builder.add_edge("format_query_response", "respond")
 builder.add_edge("respond", END)
 
 # Compile

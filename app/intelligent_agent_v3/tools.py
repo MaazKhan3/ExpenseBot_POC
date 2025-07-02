@@ -39,7 +39,6 @@ def clean_json_response(raw_response: str) -> str:
 class IntentTool(Runnable):
     def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
         print("[DEBUG] IntentTool invoked with state:", state)
-        print("[DEBUG] IntentTool run_config db:", run_config.get('db'))
         message = state["message"]
         response = llm_client.chat.completions.create(
             model=config.llm_model,
@@ -49,8 +48,13 @@ class IntentTool(Runnable):
                 {"role": "system", "content": (
                     "You are a WhatsApp expense bot. Classify the user's intent as one of: "
                     "'log_expense', 'query', 'breakdown', 'chitchat'. "
-                    "Return ONLY a valid JSON object with double quotes. "
-                    "Example: {\"intent\": \"log_expense\"}"
+                    "\n\nGuidelines:"
+                    "\n- 'query': Specific questions like 'top 5 expenses', 'most expensive', 'cheapest', 'how much did I spend on X', 'compare months', 'breakdown for past week/month', 'expenses in January', etc."
+                    "\n- 'breakdown': General requests like 'spending breakdown', 'category summary', 'overall breakdown' (without time periods)"
+                    "\n- 'log_expense': Adding/recording new expenses"
+                    "\n- 'chitchat': General conversation, greetings, non-expense related"
+                    "\nReturn ONLY a valid JSON object with double quotes. "
+                    "Example: {\"intent\": \"query\"}"
                 )},
                 {"role": "user", "content": message},
             ]
@@ -58,17 +62,17 @@ class IntentTool(Runnable):
         raw = response.choices[0].message.content
         if raw is None:
             print("[WARNING] IntentTool: LLM returned None response.")
-            return {**state, "intent": "unknown"}
+            return {**state, "intent": "chitchat"}
         
         try:
             cleaned_json = clean_json_response(raw)
             result = json.loads(cleaned_json) if cleaned_json else {}
+            intent = result.get("intent", "chitchat")
             print("[DEBUG] IntentTool output:", result)
-            return {**state, "intent": result.get("intent", "unknown")}
+            return {**state, "intent": intent}
         except Exception as e:
             print(f"[ERROR] IntentTool: Failed to parse LLM response: {e}")
-            print(f"[ERROR] Raw response: {raw}")
-            return {**state, "intent": "unknown"}
+            return {**state, "intent": "chitchat"}
 
 
 # 2. Expense Extraction Tool
@@ -399,7 +403,6 @@ class GenerateSQLTool(Runnable):
 class ExecuteSQLTool(Runnable):
     def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
         print("[DEBUG] ExecuteSQLTool invoked with state:", state)
-        print("[DEBUG] ExecuteSQLTool run_config db:", run_config.get('db'))
         db: Any = state.get("db")
         sql = state.get("sql")
         
@@ -423,61 +426,75 @@ class ExecuteSQLTool(Runnable):
             from sqlalchemy import text as sql_text
             result = db.execute(sql_text(sql))
             rows = result.fetchall()
-            colnames = result.keys()
+            
             # Always return the raw result, even if None or empty
-            if len(rows) == 1 and len(rows[0]) == 1:
-                value = rows[0][0]
-                formatted = value
+            if not rows:
+                formatted = None
+            elif len(rows) == 1 and len(rows[0]) == 1:
+                formatted = rows[0][0]
             else:
                 formatted = rows
+                
             print("[DEBUG] ExecuteSQLTool output:", formatted)
             return {**state, "sql_result": formatted}
         except Exception as e:
             print(f"[ERROR] ExecuteSQLTool: SQL execution error: {e}")
-            return {**state, "sql_result": f"SQL Error: {e}"}
+            # Return None so FormatQueryResponseTool can handle it gracefully
+            return {**state, "sql_result": None}
 
 
 # 6. Breakdown Formatter Tool
 class FormatBreakdownTool(Runnable):
     def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
         print("[DEBUG] FormatBreakdownTool invoked with state:", state)
-        print("[DEBUG] FormatBreakdownTool run_config db:", run_config.get('db'))
-        user_id = state["db_user"].id if state.get("db_user") else None
-        query = f"""
-        SELECT c.name, SUM(e.amount), COUNT(*)
-        FROM expenses e
-        JOIN categories c ON e.category_id = c.id
-        WHERE e.user_id = {user_id}
-        GROUP BY c.name
-        ORDER BY SUM(e.amount) DESC
-        """
-        db: Any = state.get("db")  # Get db from state instead of run_config
         
-        if not db:
-            print("[DEBUG] FormatBreakdownTool: No database connection.")
-            return {**state, "final_response": "Database connection not available."}
+        # Get user from database if not already in state
+        db: Any = state.get("db")
+        phone_number = state["phone_number"]
         
         try:
+            db_user = crud.get_user_by_phone_number(db, phone_number) if db else None
+            if db and not db_user:
+                db_user = crud.create_user(db, user=models.User(phone_number=phone_number))
+            
+            user_id = db_user.id if db_user else None
+            
+            # Fix the linter error by being more explicit
+            if user_id is None:
+                return {**state, "final_response": "I couldn't find your account. Please try logging an expense first."}
+            
+            query = """
+            SELECT c.name, SUM(e.amount), COUNT(*)
+            FROM expenses e
+            JOIN categories c ON e.category_id = c.id
+            WHERE e.user_id = :user_id
+            GROUP BY c.name
+            ORDER BY SUM(e.amount) DESC
+            """
+            
+            if not db:
+                return {**state, "final_response": "I'm having trouble accessing your data right now. Please try again in a moment."}
+            
             from sqlalchemy import text as sql_text
-            result = db.execute(sql_text(query)).fetchall()
+            result = db.execute(sql_text(query), {"user_id": user_id}).fetchall()
+            
+            if not result:
+                return {**state, "final_response": "You haven't logged any expenses yet! Start by telling me about a purchase you made."}
+
+            lines = ["📊 Your Spending Breakdown:"]
+            total = 0
+            for cat, amount, count in result:
+                total += amount
+                lines.append(f"• {cat.title()}: PKR {amount:,.0f} ({count} items)")
+            lines.append(f"\nTotal Spent: PKR {total:,.0f}")
+
+            output = "\n".join(lines)
+            print("[DEBUG] FormatBreakdownTool output:", output)
+            return {**state, "final_response": output}
+            
         except Exception as e:
-            print(f"[ERROR] FormatBreakdownTool: SQL execution error: {e}")
-            return {**state, "final_response": f"Error retrieving breakdown: {e}"}
-
-        if not result:
-            print("[DEBUG] FormatBreakdownTool: No expenses found.")
-            return {**state, "final_response": "No expenses found."}
-
-        lines = [f"📊 Spending Breakdown:"]
-        total = 0
-        for cat, amount, count in result:
-            total += amount
-            lines.append(f"• {cat.title()}: PKR {amount:,.0f} ({count} items)")
-        lines.append(f"Total: PKR {total:,.0f}")
-
-        output = "\n".join(lines)
-        print("[DEBUG] FormatBreakdownTool output:", output)
-        return {**state, "final_response": output}
+            print(f"[ERROR] FormatBreakdownTool: {e}")
+            return {**state, "final_response": "I'm having trouble getting your spending breakdown right now. Please try again!"}
 
 
 # 7. Chitchat Tool (Fallback for unknown intent)
@@ -521,3 +538,68 @@ class RespondTool(Runnable):
             return {**state, "final_response": str(state["sql_result"])}
         else:
             return state
+
+
+# Fix Query Response Tool to always use LLM
+class FormatQueryResponseTool(Runnable):
+    def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
+        print("[DEBUG] FormatQueryResponseTool invoked with state:", state)
+        
+        message = state["message"]
+        sql_result = state.get("sql_result")
+        
+        try:
+            # Always use LLM to format response, even for empty results
+            if sql_result is None:
+                format_prompt = f"""
+The user asked: "{message}"
+
+The database search didn't return any results - this means there are no expenses matching what they're looking for.
+
+Generate a natural, conversational response that:
+- Doesn't use technical terms like "data", "query", "criteria", "records"
+- Sounds like a helpful friend talking about expenses
+- Is encouraging and suggests next steps
+- Is specific to what they asked about
+
+Be natural and conversational, not robotic.
+"""
+            else:
+                format_prompt = f"""
+The user asked: "{message}"
+
+The database returned this result: {sql_result}
+
+Format this into a natural, friendly response that:
+- Uses proper currency formatting (PKR)
+- Is conversational and user-friendly
+- Provides context and explanation
+- Uses appropriate formatting (commas for large numbers)
+
+Respond as if you're talking directly to the user about their expenses.
+"""
+            
+            response = llm_client.chat.completions.create(
+                model=config.llm_model,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "You are a helpful financial assistant that provides clear, friendly, conversational responses. Never use technical terms like 'data', 'query', 'criteria', 'records'. Talk like a friendly helper."},
+                    {"role": "user", "content": format_prompt},
+                ]
+            )
+            
+            formatted_response = response.choices[0].message.content
+            if formatted_response is None or not formatted_response.strip():
+                # This should rarely happen, but just in case
+                formatted_response = "I'm having trouble understanding that right now. Could you try asking in a different way?"
+            else:
+                formatted_response = formatted_response.strip()
+            
+            print("[DEBUG] FormatQueryResponseTool output:", formatted_response)
+            return {**state, "final_response": formatted_response}
+            
+        except Exception as e:
+            print(f"[ERROR] FormatQueryResponseTool: {e}")
+            # Even error handling should be LLM-generated, but as a last resort fallback
+            return {**state, "final_response": "I'm having trouble with that right now. Could you try asking me something else about your expenses?"}
