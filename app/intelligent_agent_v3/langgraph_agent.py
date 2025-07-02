@@ -12,6 +12,7 @@ from .tools import (
     ChitchatTool,
     RespondTool,
     FormatQueryResponseTool,
+    get_conversation_context,
 )
 
 
@@ -79,6 +80,9 @@ expense_agent_graph = builder.compile()
 
 # 4. Entry point with corrected config
 def run_expense_agent(phone_number: str, message: str, db):
+    # Load existing conversation context
+    existing_context = get_conversation_context(db, phone_number)
+    
     state = {
         "phone_number": phone_number,
         "message": message,
@@ -90,9 +94,9 @@ def run_expense_agent(phone_number: str, message: str, db):
         "sql_result": None,
         "final_response": None,
         "db": db,
-        "pending_context": None,
+        "pending_context": existing_context,  # ✅ Load previous context!
     }
     
-    print("[DEBUG] Running agent with db:", db)
+    print(f"[DEBUG] Running agent with existing context: {existing_context}")
     result = expense_agent_graph.invoke(state)
     return result

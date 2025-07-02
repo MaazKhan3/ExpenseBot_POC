@@ -2,12 +2,13 @@
 
 #from langchain_core.tools import tool
 from langchain_core.runnables import Runnable
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from groq import Groq
 import json, re
 from dotenv import load_dotenv
 from app import crud, models
 from app.intelligent_agent_v3.config import config
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -33,6 +34,64 @@ def clean_json_response(raw_response: str) -> str:
         return json_match.group(0)
     
     return raw_response
+
+
+# Add context management functions
+def get_conversation_context(db, phone_number: str):
+    """Retrieve stored conversation context"""
+    try:
+        user = crud.get_user_by_phone_number(db, phone_number)
+        if not user:
+            return {}
+        
+        # For now, let's use a simple approach - store in a new table or 
+        # use a cache. For immediate fix, let's add a context field to User model
+        # But first, let's implement a simpler solution using a global cache
+        
+        # Check if context exists and is recent (within 5 minutes)
+        cache_key = f"context_{phone_number}"
+        if hasattr(get_conversation_context, '_cache'):
+            cached = get_conversation_context._cache.get(cache_key)
+            if cached and cached.get('timestamp'):
+                if datetime.now() - cached['timestamp'] < timedelta(minutes=5):
+                    return cached.get('context', {})
+        
+        return {}
+    except:
+        return {}
+
+def store_conversation_context(db, phone_number: str, context: dict):
+    """Store conversation context - only keep the most recent incomplete expense"""
+    try:
+        if not hasattr(store_conversation_context, '_cache'):
+            store_conversation_context._cache = {}
+        
+        cache_key = f"context_{phone_number}"
+        
+        # If context is empty or None, clear the cache
+        if not context:
+            if cache_key in store_conversation_context._cache:
+                del store_conversation_context._cache[cache_key]
+            return
+        
+        # Only store single context dict, not lists
+        if isinstance(context, dict):
+            store_conversation_context._cache[cache_key] = {
+                'context': context,
+                'timestamp': datetime.now()
+            }
+        else:
+            # If somehow a list is passed, take the last item
+            if isinstance(context, list) and context:
+                store_conversation_context._cache[cache_key] = {
+                    'context': context[-1],  # Take most recent
+                    'timestamp': datetime.now()
+                }
+        
+        # Also store reference in get_conversation_context
+        get_conversation_context._cache = store_conversation_context._cache
+    except Exception as e:
+        print(f"[ERROR] Failed to store context: {e}")
 
 
 # 1. Intent Detection Tool
@@ -75,15 +134,15 @@ class IntentTool(Runnable):
             return {**state, "intent": "chitchat"}
 
 
-# 2. Expense Extraction Tool
+# 2. Completely Rewritten Expense Extraction Tool
 class ExtractExpenseTool(Runnable):
     def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
         print("[DEBUG] ExtractExpenseTool invoked with state:", state)
-        print("[DEBUG] ExtractExpenseTool run_config db:", run_config.get('db'))
-        db: Any = state.get("db")  # Get db from state instead of run_config
+        db: Any = state.get("db")
         message = state["message"]
         phone_number = state["phone_number"]
 
+        # Get or create user
         db_user = crud.get_user_by_phone_number(db, phone_number) if db else None
         if db and not db_user:
             db_user = crud.create_user(db, user=models.User(phone_number=phone_number))
@@ -91,262 +150,248 @@ class ExtractExpenseTool(Runnable):
         # Check for pending context from previous messages
         pending_context = state.get("pending_context", {})
         
-        # If we have pending context, try to merge it with current message
+        # Fix: Handle case where pending_context is a list
+        if isinstance(pending_context, list):
+            pending_context = pending_context[-1] if pending_context else {}
+            print(f"[DEBUG] Fixed list context to: {pending_context}")
+        
+        # Enhanced context processing
         if pending_context:
             enhanced_message = self._enhance_message_with_context(message, pending_context)
             print(f"[DEBUG] Enhanced message with context: {enhanced_message}")
         else:
             enhanced_message = message
 
-        # First, check if this is an incomplete expense
-        is_incomplete = self._detect_incomplete_expense(enhanced_message)
-        
-        if is_incomplete:
-            # Handle incomplete expense
-            return self._handle_incomplete_expense(enhanced_message, state, db_user)
-        
+        # Use LLM to extract expenses intelligently
         response = llm_client.chat.completions.create(
             model=config.llm_model,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             messages=[
                 {"role": "system", "content": (
-                    "Extract expenses from user message. Return ONLY valid JSON with double quotes. "
-                    "Format: {\"expenses\": [{\"amount\": 500, \"category\": \"groceries\", \"note\": \"optional\"}]} "
-                    "Use smart categorization: food (groceries, lunch, dinner, snacks), transportation (fuel, taxi, bus), "
-                    "entertainment (movies, games, sports), shopping (clothes, electronics), health (medicine, doctor), "
-                    "education (books, courses), utilities (electricity, water), sports (equipment, gym, tennis, cricket), other. "
-                    "Always extract meaningful notes from the item description. "
-                    "For sports equipment like tennis racket, categorize as 'sports'. "
-                    "For food items like apples, mangoes, categorize as 'food'."
+                    "You are an intelligent expense extraction system. Extract expenses from user messages.\n\n"
+                    "IMPORTANT RULES:\n"
+                    "1. Extract ALL complete expenses (both amount and item mentioned)\n"
+                    "2. Handle multiple expenses in one message: 'soccer ball: 8k, shoes: 11k, socks: 800'\n"
+                    "3. Handle various formats: '8000', '8k', '8K', '8,000'\n"
+                    "4. Smart categorization: food/groceries, transportation/transport, entertainment, shopping/clothing, health, electronics, sports, rent/housing, other\n"
+                    "5. Extract meaningful notes from item descriptions\n"
+                    "6. If message has amount AND item, it's COMPLETE - extract it\n"
+                    "7. If missing amount OR item, mark as incomplete\n\n"
+                    "Return JSON format:\n"
+                    "{\n"
+                    '  "complete_expenses": [{"amount": 8000, "category": "sports", "note": "soccer ball"}],\n'
+                    '  "incomplete_expense": {"type": "missing_amount", "item": "shoes"} OR {"type": "missing_item", "amount": 5000} OR null\n'
+                    "}\n\n"
+                    "Examples:\n"
+                    "- 'soccer ball 8k' → complete\n"
+                    "- 'I spent 500 PKR' → incomplete (missing item)\n"
+                    "- 'bought shoes' → incomplete (missing amount)\n"
+                    "- 'phone 25k, lunch 300' → both complete"
                 )},
                 {"role": "user", "content": enhanced_message},
             ]
         )
+        
         raw = response.choices[0].message.content
-        print("[DEBUG] ExtractExpenseTool raw LLM output:", raw)
-        if raw is None:
-            print("[WARNING] ExtractExpenseTool: LLM returned None response.")
-            return {**state, "db_user": db_user, "expenses": []}
+        print(f"[DEBUG] ExtractExpenseTool raw LLM output: {raw}")
         
         try:
+            if raw is None:
+                raw = "{}"
             cleaned_json = clean_json_response(raw)
-            data = json.loads(cleaned_json) if cleaned_json else {}
-            expenses = data.get("expenses", [])
-            print("[DEBUG] ExtractExpenseTool output:", expenses)
-            return {**state, "db_user": db_user, "expenses": expenses}
+            result = json.loads(cleaned_json) if cleaned_json else {}
+            
+            complete_expenses = result.get("complete_expenses", [])
+            incomplete_expense = result.get("incomplete_expense")
+            
+            print(f"[DEBUG] ExtractExpenseTool extracted: {len(complete_expenses)} complete, incomplete: {incomplete_expense}")
+            
+            # Prepare return state
+            new_state = {**state, "db_user": db_user, "expenses": complete_expenses}
+            
+            # Handle incomplete expense - ensure it's a dict, not a list
+            if incomplete_expense and isinstance(incomplete_expense, dict):
+                new_state["pending_context"] = incomplete_expense
+            else:
+                new_state["pending_context"] = {}
+                
+            return new_state
+            
         except Exception as e:
             print(f"[ERROR] ExtractExpenseTool: Failed to parse LLM response: {e}")
-            print(f"[ERROR] Raw response: {raw}")
-            return {**state, "db_user": db_user, "expenses": []}
-    
-    def _detect_incomplete_expense(self, message: str) -> bool:
-        """Detect if the message represents an incomplete expense"""
-        message_lower = message.lower()
-        
-        # Check for patterns that indicate incomplete expenses
-        incomplete_patterns = [
-            # Missing amount patterns
-            "bought", "got", "purchased", "bought a", "got a", "purchased a",
-            "tennis racket", "shoes", "book", "phone", "laptop",
-            # Missing item patterns  
-            "spent", "paid", "cost", "expense",
-            # Just numbers
-            lambda msg: msg.strip().replace(',', '').replace('k', '').replace('m', '').isdigit()
-        ]
-        
-        for pattern in incomplete_patterns:
-            if callable(pattern):
-                if pattern(message_lower):
-                    return True
-            elif pattern in message_lower:
-                return True
-        
-        return False
-    
-    def _handle_incomplete_expense(self, message: str, state: Dict[str, Any], db_user) -> Dict[str, Any]:
-        """Handle incomplete expense by setting up pending context"""
-        message_lower = message.lower()
-        
-        # Check if it's missing amount (has item but no amount)
-        if any(word in message_lower for word in ["bought", "got", "purchased", "tennis racket", "shoes"]):
-            # Extract the item name
-            item_name = self._extract_item_name(message)
-            pending_context = {"item": item_name, "type": "missing_amount"}
-            return {**state, "db_user": db_user, "expenses": [], "pending_context": pending_context}
-        
-        # Check if it's missing item (has amount but no item)
-        elif any(word in message_lower for word in ["spent", "paid", "cost"]):
-            # Extract the amount
-            amount = self._extract_amount(message)
-            if amount:
-                pending_context = {"amount": amount, "type": "missing_item"}
-                return {**state, "db_user": db_user, "expenses": [], "pending_context": pending_context}
-        
-        # Just a number
-        elif message.strip().replace(',', '').replace('k', '').replace('m', '').isdigit():
-            amount = self._extract_amount(message)
-            if amount:
-                pending_context = {"amount": amount, "type": "missing_item"}
-                return {**state, "db_user": db_user, "expenses": [], "pending_context": pending_context}
-        
-        return {**state, "db_user": db_user, "expenses": []}
-    
-    def _extract_item_name(self, message: str) -> str:
-        """Extract item name from incomplete expense message"""
-        # Simple extraction - look for common patterns
-        if "tennis racket" in message.lower():
-            return "tennis racket"
-        elif "shoes" in message.lower():
-            return "shoes"
-        elif "bought" in message.lower():
-            # Extract what comes after "bought"
-            parts = message.lower().split("bought")
-            if len(parts) > 1:
-                item = parts[1].strip()
-                # Remove common words
-                item = item.replace("a ", "").replace("an ", "").replace("the ", "")
-                return item
-        return "item"
-    
-    def _extract_amount(self, message: str) -> Optional[float]:
-        """Extract amount from message"""
-        import re
-        
-        # Look for numbers with k, m suffixes
-        patterns = [
-            r'(\d+(?:\.\d+)?)k',  # 2k, 1.5k
-            r'(\d+(?:\.\d+)?)m',  # 1m, 1.5m
-            r'(\d+(?:,\d+)*)',    # 1,000, 2,500
-            r'(\d+(?:\.\d+)?)',   # 500, 1.5
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, message)
-            if match:
-                value = match.group(1)
-                if 'k' in message[match.start():match.end()]:
-                    return float(value) * 1000
-                elif 'm' in message[match.start():match.end()]:
-                    return float(value) * 1000000
-                else:
-                    return float(value.replace(',', ''))
-        
-        return None
-    
+            return {**state, "db_user": db_user, "expenses": [], "pending_context": {}}
+
     def _enhance_message_with_context(self, message: str, pending_context: dict) -> str:
-        """Enhance current message with pending context"""
-        if pending_context.get("item") and not any(word in message.lower() for word in ["spent", "bought", "cost", "paid"]):
-            # If we have a pending item and current message looks like just an amount
-            return f"{message} for {pending_context['item']}"
-        elif pending_context.get("amount") and not any(char.isdigit() for char in message):
-            # If we have a pending amount and current message looks like just an item
-            return f"{pending_context['amount']} for {message}"
+        """Enhance current message with pending context intelligently"""
+        if pending_context.get("type") == "missing_amount" and pending_context.get("item"):
+            # We were asking for amount, now they provided it
+            item = pending_context["item"]
+            return f"{message} for {item}"
+        elif pending_context.get("type") == "missing_item" and pending_context.get("amount"):
+            # We were asking for item, now they provided it
+            amount = pending_context["amount"]
+            return f"{amount} PKR for {message}"
         return message
 
 
-# 3. Expense Creation Tool
+# 3. Completely Rewritten Expense Creation Tool
 class CreateExpenseTool(Runnable):
     def invoke(self, state: Dict[str, Any], run_config: Dict[str, Any] = {}) -> Dict[str, Any]:
         print("[DEBUG] CreateExpenseTool invoked with state:", state)
-        print("[DEBUG] CreateExpenseTool run_config db:", run_config.get('db'))
-        db: Any = state.get("db")  # Get db from state instead of run_config
+        db: Any = state.get("db")
         user = state["db_user"]
         user_id = user.id if user else None
         expenses = state.get("expenses", [])
+        pending_context = state.get("pending_context", {})
+        message = state["message"]
+        phone_number = state["phone_number"]
 
-        inserted = []
-        incomplete_expenses = []
-        new_pending_context = {}
-        
-        if db and user_id:
-            for item in expenses:
-                amount = item.get("amount")
-                category_name = item.get("category")
-                note = item.get("note", "")
+        # Fix: Handle case where pending_context is a list
+        if isinstance(pending_context, list):
+            pending_context = pending_context[-1] if pending_context else {}
+            print(f"[DEBUG] CreateExpenseTool: Fixed list context to: {pending_context}")
 
-                if not amount or not category_name:
-                    incomplete_expenses.append(item)
-                    # Store pending context for next message
-                    if not amount and category_name:
-                        new_pending_context = {"item": category_name, "type": "missing_amount"}
-                    elif amount and not category_name:
-                        new_pending_context = {"amount": amount, "type": "missing_item"}
-                    continue
-                    
-                category = crud.get_or_create_category(db, user_id, category_name)
-                category_id = getattr(category, "id", None)
-                if category_id is not None:
-                    expense = crud.create_expense(db, user_id, category_id, amount, note)
-                    inserted.append(expense)
+        # If we have complete expenses, log them
+        if expenses and db and user_id:
+            inserted = []
+            for expense in expenses:
+                try:
+                    amount = expense.get("amount")
+                    category_name = expense.get("category")
+                    note = expense.get("note", "")
 
-        if incomplete_expenses:
-            # Generate clarification message for incomplete expenses
-            clarification_msg = self._generate_clarification_message(incomplete_expenses)
-            msg = clarification_msg
-            # Store pending context for next message
-            state["pending_context"] = new_pending_context
-        elif state.get("pending_context"):
-            # We have pending context but no expenses to process
-            clarification_msg = self._generate_clarification_message_from_context(state["pending_context"])
-            msg = clarification_msg
-        else:
-            # Generate detailed success message
-            msg = self._generate_detailed_success_message(inserted, db)
-            # Clear any pending context since we successfully logged everything
-            state["pending_context"] = {}
-            
-        print("[DEBUG] CreateExpenseTool output:", msg)
-        return {**state, "final_response": msg}
-    
-    def _generate_clarification_message(self, incomplete_expenses):
-        """Generate a natural clarification message for incomplete expenses"""
-        if len(incomplete_expenses) == 1:
-            expense = incomplete_expenses[0]
-            if not expense.get("amount") and expense.get("category"):
-                item_name = expense['category']
-                return f"How much did you spend on {item_name}?"
-            elif expense.get("amount") and not expense.get("category"):
-                amount = expense['amount']
-                return f"What did you spend {amount} PKR on?"
-        else:
-            return "I need more details for some expenses. Could you provide the missing amounts or categories?"
-        
-        return "I need more information to log this expense properly. Could you provide the missing details?"
-    
-    def _generate_clarification_message_from_context(self, pending_context):
-        """Generate clarification message from pending context"""
-        if pending_context.get("type") == "missing_amount":
-            item = pending_context.get("item", "this item")
-            return f"How much did you spend on {item}?"
-        elif pending_context.get("type") == "missing_item":
-            amount = pending_context.get("amount")
-            return f"What did you spend {amount} PKR on?"
-        else:
-            return "I need more information to log this expense properly. Could you provide the missing details?"
-    
-    def _generate_detailed_success_message(self, inserted_expenses, db):
-        """Generate a detailed success message showing what was logged"""
-        if not inserted_expenses:
-            return "No expenses were logged."
-        
+                    if amount and category_name:
+                        category = crud.get_or_create_category(db, user_id, category_name)
+                        category_id = getattr(category, "id", None)
+                        if category_id is not None:
+                            new_expense = crud.create_expense(db, user_id, category_id, amount, note)
+                            inserted.append(new_expense)
+                except Exception as e:
+                    print(f"[ERROR] CreateExpenseTool: Failed to create expense: {e}")
+
+            if inserted:
+                # Clear context after successful expense logging
+                store_conversation_context(db, phone_number, {})
+                response_message = self._generate_intelligent_success_message(inserted, db)
+                return {**state, "final_response": response_message, "pending_context": {}}
+
+        # If we have pending context, store it and generate clarification
+        if pending_context:
+            store_conversation_context(db, phone_number, pending_context)
+            clarification = self._generate_intelligent_clarification(pending_context, message)
+            return {**state, "final_response": clarification}
+
+        # If no expenses extracted and no pending context
+        if not expenses and not pending_context:
+            # Clear any stale context
+            store_conversation_context(db, phone_number, {})
+            no_expense_response = self._generate_no_expense_response(message)
+            return {**state, "final_response": no_expense_response, "pending_context": {}}
+
+        return {**state, "final_response": "I'm having trouble understanding that expense. Could you try rephrasing it?"}
+
+    def _generate_intelligent_success_message(self, inserted_expenses, db):
+        """Generate natural success message using LLM"""
         if len(inserted_expenses) == 1:
             expense = inserted_expenses[0]
             category = db.query(models.Category).filter(models.Category.id == expense.category_id).first()
             category_name = category.name if category else "unknown"
             note_text = f" ({expense.note})" if expense.note else ""
-            return f"✅ Logged {expense.amount} PKR for {category_name}{note_text}"
+            
+            prompt = f"The user successfully logged an expense: {expense.amount} PKR for {category_name}{note_text}. Generate a natural, encouraging confirmation message. Be conversational and friendly."
         else:
-            lines = [f"✅ Logged {len(inserted_expenses)} expenses:"]
-            total = 0
-            for expense in inserted_expenses:
-                category = db.query(models.Category).filter(models.Category.id == expense.category_id).first()
-                category_name = category.name if category else "unknown"
-                note_text = f" ({expense.note})" if expense.note else ""
-                lines.append(f"• {expense.amount} PKR - {category_name}{note_text}")
-                total += expense.amount
-            lines.append(f"Total: {total} PKR")
-            return "\n".join(lines)
+            total = sum(exp.amount for exp in inserted_expenses)
+            prompt = f"The user successfully logged {len(inserted_expenses)} expenses totaling {total} PKR. Generate a natural, encouraging confirmation message that mentions the count and total. Be conversational and friendly."
+
+        try:
+            response = llm_client.chat.completions.create(
+                model=config.llm_model,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "You are a helpful financial assistant. Generate brief, natural confirmation messages for logged expenses. Be encouraging and conversational."},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            
+            result = response.choices[0].message.content
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            print(f"[ERROR] Failed to generate success message: {e}")
+
+        # Fallback
+        if len(inserted_expenses) == 1:
+            expense = inserted_expenses[0]
+            category = db.query(models.Category).filter(models.Category.id == expense.category_id).first()
+            category_name = category.name if category else "unknown"
+            return f"✅ Got it! Logged {expense.amount} PKR for {category_name}."
+        else:
+            total = sum(exp.amount for exp in inserted_expenses)
+            return f"✅ Perfect! Logged {len(inserted_expenses)} expenses totaling {total} PKR."
+
+    def _generate_intelligent_clarification(self, pending_context, original_message):
+        """Generate natural clarification question using LLM"""
+        if pending_context.get("type") == "missing_amount":
+            item = pending_context.get("item", "that item")
+            prompt = f"The user mentioned buying '{item}' but didn't say how much it cost. Generate a natural, conversational question asking for the amount in PKR. Be friendly and specific about the item."
+        elif pending_context.get("type") == "missing_item":
+            amount = pending_context.get("amount", "some money")
+            prompt = f"The user said they spent {amount} PKR but didn't mention what they bought. Generate a natural, conversational question asking what they purchased. Be friendly."
+        else:
+            prompt = f"The user said '{original_message}' but it's unclear what expense they want to log. Generate a natural, helpful question to clarify."
+
+        try:
+            response = llm_client.chat.completions.create(
+                model=config.llm_model,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "You are a helpful financial assistant. Generate natural, conversational questions to clarify incomplete expense information. Be friendly and specific."},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            
+            result = response.choices[0].message.content
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            print(f"[ERROR] Failed to generate clarification: {e}")
+
+        # Fallback
+        if pending_context.get("type") == "missing_amount":
+            item = pending_context.get("item", "that")
+            return f"How much did you spend on {item}? (in PKR)"
+        elif pending_context.get("type") == "missing_item":
+            amount = pending_context.get("amount", "that amount")
+            return f"What did you spend {amount} PKR on?"
+        else:
+            return "Could you tell me what you bought and how much you spent? (in PKR)"
+
+    def _generate_no_expense_response(self, message):
+        """Generate intelligent response when no expense is detected"""
+        prompt = f"The user said '{message}' but I couldn't detect any specific expense to log. Generate a natural, helpful response that encourages them to share expense details in PKR. Be conversational and give an example."
+
+        try:
+            response = llm_client.chat.completions.create(
+                model=config.llm_model,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "You are a helpful financial assistant. When users mention expenses but don't provide enough detail, guide them naturally. Be encouraging and give examples."},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            
+            result = response.choices[0].message.content
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            print(f"[ERROR] Failed to generate no expense response: {e}")
+
+        # Fallback
+        return "I'd love to help you log that expense! Could you tell me what you bought and how much you spent? For example: 'I spent 500 PKR on lunch' or 'bought groceries for 2000 PKR'."
 
 
 # 4. SQL Generation Tool (for queries)
